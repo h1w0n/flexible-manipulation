@@ -1,0 +1,25 @@
+# ROS 2
+build/
+install/
+log/
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.env
+
+# Credentials
+*.pem
+*.key
+*credentials*
+*secret*
+
+# IDE
+.vscode/
+.idea/
+
+# Isaac Sim temporary files
+*.usd~
+*.usdc~
