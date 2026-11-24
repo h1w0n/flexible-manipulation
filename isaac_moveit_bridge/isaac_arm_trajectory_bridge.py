@@ -1,5 +1,6 @@
 
 import math
+import os
 import time
 
 import rclpy
@@ -17,6 +18,8 @@ JOINTS = ['joint1', 'joint2', 'joint3', 'joint4']
 
 # 임시 안전 컷오프: 시작 위치에서 관절당 최대 0.1rad 이동
 MAX_MOVE = 0.1
+STRICT_GOAL_TOLERANCE = 0.01
+SEQUENCE_TEST_GOAL_TOLERANCE = 0.05
 
 
 class IsaacArmBridge(Node):
@@ -29,6 +32,11 @@ class IsaacArmBridge(Node):
         self.positions = {}
         self.last_state_time = 0.0
         self.busy = False
+        self.sequence_test = os.environ.get('FLEX_SEQUENCE_TEST') == '1'
+        self.goal_tolerance = (
+            SEQUENCE_TEST_GOAL_TOLERANCE
+            if self.sequence_test else STRICT_GOAL_TOLERANCE
+        )
 
         # Isaac Sim으로 관절 명령 발행
         self.pub = self.create_publisher(
@@ -58,7 +66,9 @@ class IsaacArmBridge(Node):
         )
 
         self.get_logger().info(
-            'Isaac Sim 브리지 실행 준비 완료'
+            'Isaac Sim 브리지 실행 준비 완료: '
+            f"sequence_test={self.sequence_test}, "
+            f"goal_tolerance={self.goal_tolerance:.3f}rad"
         )
 
     def state_callback(self, msg):
@@ -233,9 +243,8 @@ class IsaacArmBridge(Node):
             final = dict(zip(names, points[-1].positions))
             final_positions = [final[j] for j in JOINTS]
 
-            # 임시 목표 도달 허용 오차: 0.01rad
-            GOAL_TOLERANCE = 0.01
             stable_count = 0
+            last_counted_state_time = 0.0
 
             # 최대 2초 동안 목표 위치 유지 및 도달 확인
             for _ in range(40):
@@ -256,16 +265,24 @@ class IsaacArmBridge(Node):
                     and all(j in self.positions for j in JOINTS)
                 )
 
+                if not fresh:
+                    goal_handle.abort()
+                    result.error_code = result.PATH_TOLERANCE_VIOLATED
+                    result.error_string = 'Joint state timeout'
+                    return result
+
                 reached = (
                     fresh
                     and all(
-                        abs(self.positions[j] - final[j]) < GOAL_TOLERANCE
+                        abs(self.positions[j] - final[j]) < self.goal_tolerance
                         for j in JOINTS
                     )
                 )
 
                 if reached:
-                    stable_count += 1
+                    if self.last_state_time > last_counted_state_time:
+                        stable_count += 1
+                        last_counted_state_time = self.last_state_time
                 else:
                     stable_count = 0
 
@@ -291,7 +308,11 @@ class IsaacArmBridge(Node):
             result.error_string = 'Goal position not reached'
 
             self.get_logger().error(
-                '목표 위치 도달 확인 실패'
+                '목표 위치 도달 확인 실패: '
+                + ', '.join(
+                    f'{j}={abs(self.positions[j] - final[j]):.4f}rad'
+                    for j in JOINTS
+                )
             )
 
             return result

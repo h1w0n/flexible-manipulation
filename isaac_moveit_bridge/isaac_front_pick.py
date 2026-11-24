@@ -20,11 +20,12 @@ CLOSE_POSITION = -0.010
 # 임시 안전 컷오프
 MAX_STEP = 0.020        # 이동 1회당 최대 2cm
 MAX_ERROR_MM = 10.0      # Pick 전 말단 위치 오차
+SEQUENCE_TEST_MAX_ERROR_MM = 15.0  # 빈 공간 통합 시험 전용 상한
 
 
-def get_xyz(node):
+def get_xyz(node, diagnose_fk=False):
     state = node.get_current_state()
-    pose = node.get_fk(state)
+    pose = node.get_fk(state, diagnose=diagnose_fk)
 
     return [
         pose.position.x,
@@ -84,7 +85,7 @@ def send_gripper(node, client, position, label):
     print(f"[OK] {label} 완료")
 
 
-def move_xyz(node, target, label):
+def move_xyz(node, target, label, sequence_test=False):
     print(f"\n[ARM] {label}")
     print(
         f"목표: ({target[0]:.4f}, "
@@ -110,17 +111,31 @@ def move_xyz(node, target, label):
         dz=0.0,
     )
 
-    node.run(args)
+    result = node.run(args)
+    actual = result["actual_xyz"]
+    error_mm = result["error_mm"]
 
-    actual = get_xyz(node)
-    error_mm = math.dist(actual, target) * 1000
-
+    print(f"[검증] 실제 좌표: {tuple(round(v, 5) for v in actual)}")
     print(f"[검증] 위치 오차: {error_mm:.2f}mm")
+    print(
+        f"[검증] MoveIt: status={result['action_status']}, "
+        f"code={result['moveit_code']}"
+    )
 
-    if error_mm > MAX_ERROR_MM:
+    limit_mm = (
+        SEQUENCE_TEST_MAX_ERROR_MM if sequence_test else MAX_ERROR_MM
+    )
+    if error_mm > limit_mm:
         raise RuntimeError(
-            "목표 위치 오차가 5mm를 초과했습니다. "
+            f"목표 위치 오차 {error_mm:.2f}mm가 "
+            f"허용 상한 {limit_mm:.1f}mm를 초과했습니다. "
             "다음 동작을 중단합니다."
+        )
+
+    if sequence_test and error_mm > MAX_ERROR_MM:
+        print(
+            f"[경고] 정밀 Pick 기준 {MAX_ERROR_MM:.1f}mm 초과. "
+            "빈 공간 시퀀스 검증만 계속합니다."
         )
 
     print(f"[OK] {label} 완료")
@@ -129,9 +144,9 @@ def move_xyz(node, target, label):
 def main():
     parser = argparse.ArgumentParser()
 
-    parser.add_argument("--x", type=float, required=True)
-    parser.add_argument("--y", type=float, required=True)
-    parser.add_argument("--z", type=float, required=True)
+    parser.add_argument("--x", type=float)
+    parser.add_argument("--y", type=float)
+    parser.add_argument("--z", type=float)
 
     parser.add_argument(
         "--approach", type=float, default=0.010
@@ -142,13 +157,20 @@ def main():
     parser.add_argument(
         "--dry-run", action="store_true"
     )
+    parser.add_argument(
+        "--sequence-test", action="store_true",
+        help="빈 공간 통합 시험: 10~15mm 오차는 경고, 15mm 초과는 중단",
+    )
 
     args = parser.parse_args()
 
-    values = [
-        args.x, args.y, args.z,
-        args.approach, args.lift,
-    ]
+    coordinates = [args.x, args.y, args.z]
+    if any(value is None for value in coordinates):
+        if not (args.dry_run and all(value is None for value in coordinates)):
+            parser.error("--x, --y, --z를 모두 입력하거나 --dry-run만 사용하세요.")
+
+    values = [value for value in coordinates if value is not None]
+    values.extend([args.approach, args.lift])
 
     if not all(math.isfinite(v) for v in values):
         parser.error("좌표는 유한한 숫자여야 합니다.")
@@ -161,24 +183,35 @@ def main():
             "approach와 lift는 0보다 크고 0.02m 이하여야 합니다."
         )
 
-    target = [args.x, args.y, args.z]
+    target = coordinates if args.x is not None else None
 
     # 물체 위쪽 접근점
-    pre_pick = [
-        args.x, args.y, args.z + args.approach
-    ]
+    pre_pick = (
+        [args.x, args.y, args.z + args.approach]
+        if target is not None else None
+    )
 
     rclpy.init()
     node = CartesianMove()
 
+    failed = False
     try:
-        current = get_xyz(node)
+        current = get_xyz(node, diagnose_fk=args.dry_run)
+
+        if args.dry_run and target is None:
+            print("\n[DRY RUN] FK 확인 완료. 현재 말단 위치:", current)
+            return
 
         print("\n=== FRONT PICK ===")
         print("현재 위치:", current)
         print("접근 위치:", pre_pick)
         print("Pick 위치:", target)
         print("Lift 높이:", args.lift)
+        if args.sequence_test:
+            print(
+                "[SEQUENCE TEST] 물체 없는 빈 공간 전용. "
+                "파지 성공이나 위치 정확도를 보증하지 않습니다."
+            )
 
         if math.dist(current, pre_pick) > MAX_STEP:
             raise RuntimeError(
@@ -205,10 +238,10 @@ def main():
         )
 
         # STEP 2: 접근
-        move_xyz(node, pre_pick, "PRE_PICK")
+        move_xyz(node, pre_pick, "PRE_PICK", args.sequence_test)
 
         # STEP 3: Pick 위치
-        move_xyz(node, target, "PICK")
+        move_xyz(node, target, "PICK", args.sequence_test)
 
         # STEP 4: CLOSE
         send_gripper(
@@ -224,7 +257,10 @@ def main():
             actual[2] + args.lift,
         ]
 
-        move_xyz(node, lift_target, "LIFT")
+        move_xyz(node, lift_target, "LIFT", args.sequence_test)
+
+        final_xyz = get_xyz(node)
+        print("최종 말단 좌표:", tuple(round(v, 5) for v in final_xyz))
 
         print("\n=== PICK 시퀀스 완료 ===")
         print("물체 파지 및 유지 여부는 화면에서 확인하세요.")
@@ -232,11 +268,15 @@ def main():
     except Exception as e:
         print(f"\n[중단] {e}")
         print("이후 동작은 실행하지 않습니다.")
+        failed = True
 
     finally:
         node.destroy_node()
         if rclpy.ok():
             rclpy.shutdown()
+
+    if failed:
+        raise SystemExit(1)
 
 
 if __name__ == "__main__":

@@ -90,24 +90,85 @@ class CartesianMove(Node):
 
         raise RuntimeError("/joint_states 수신 실패")
 
-    def get_fk(self, state):
+    def _call_fk(self, request, label):
+        if not self.fk_client.wait_for_service(timeout_sec=5.0):
+            raise RuntimeError(f"{label}: /compute_fk 서비스 없음")
+
+        started = time.monotonic()
+        future = self.fk_client.call_async(request)
+        try:
+            response = wait_future(self, future, label)
+        except Exception as exc:
+            self.get_logger().error(
+                f"{label}: {type(exc).__name__}: {exc}; "
+                f"elapsed={time.monotonic() - started:.2f}s, "
+                f"future_done={future.done()}, "
+                f"service_ready={self.fk_client.service_is_ready()}"
+            )
+            raise
+
+        self.get_logger().info(
+            f"{label}: elapsed={time.monotonic() - started:.2f}s, "
+            f"error_code={response.error_code.val}, "
+            f"poses={len(response.pose_stamped)}"
+        )
+        return response
+
+    def get_fk(self, state, diagnose=False):
         request = GetPositionFK.Request()
         request.header.frame_id = BASE_FRAME
         request.fk_link_names = [TIP_LINK]
         request.robot_state.joint_state = state
 
-        response = wait_future(
-            self,
-            self.fk_client.call_async(request),
-            "FK 계산",
-        )
+        if diagnose:
+            self.get_logger().info(
+                "FK 명시 상태 요청: "
+                f"frame={BASE_FRAME}, link={TIP_LINK}, "
+                f"is_diff={request.robot_state.is_diff}, "
+                f"joint_names={list(state.name)}, "
+                f"positions={len(state.position)}"
+            )
+
+        try:
+            response = self._call_fk(request, "FK 명시 상태")
+        except Exception:
+            if diagnose:
+                self._probe_fk_current_state()
+            raise
+
+        if diagnose and not self._probe_fk_current_state():
+            raise RuntimeError("FK 빈 diff 비교 요청 실패")
 
         if response.error_code.val != 1:
             raise RuntimeError(
                 f"FK 실패: {response.error_code.val}"
             )
 
+        if not response.pose_stamped:
+            raise RuntimeError("FK 성공 코드지만 pose_stamped가 비어 있습니다")
+
         return response.pose_stamped[0].pose
+
+    def _probe_fk_current_state(self):
+        # 진단용 비교 요청이며 원래 FK 실패를 성공으로 대체하지 않는다.
+        request = GetPositionFK.Request()
+        request.header.frame_id = BASE_FRAME
+        request.fk_link_names = [TIP_LINK]
+        request.robot_state.is_diff = True
+        self.get_logger().info(
+            "FK 빈 diff 비교 요청: is_diff=True, joint_names=[]"
+        )
+        try:
+            response = self._call_fk(request, "FK 빈 diff 비교")
+            if response.error_code.val != 1 or not response.pose_stamped:
+                raise RuntimeError(
+                    f"FK 빈 diff 비교 오류: code={response.error_code.val}, "
+                    f"poses={len(response.pose_stamped)}"
+                )
+        except Exception as exc:
+            self.get_logger().error(f"FK 빈 diff 비교도 실패: {exc}")
+            return False
+        return True
 
     def solve_ik(self, state, target, orientation):
         request = GetPositionIK.Request()
@@ -124,7 +185,7 @@ class CartesianMove(Node):
         ik.pose_stamped.pose.orientation = orientation
 
         ik.timeout.sec = 1
-        ik.avoid_collisions = False
+        ik.avoid_collisions = True
 
         response = wait_future(
             self,
@@ -211,8 +272,11 @@ class CartesianMove(Node):
             or code != 1
         ):
             raise RuntimeError(
-                "MoveIt 경로 계획 또는 실행 실패"
+                "MoveIt 경로 계획 또는 실행 실패: "
+                f"status={wrapped.status}, code={code}"
             )
+
+        return code, wrapped.status
 
     def run(self, args):
 
@@ -305,7 +369,7 @@ class CartesianMove(Node):
                     "로봇 자세가 변경됨. 다시 실행 필요"
                 )
 
-        self.execute(solution)
+        moveit_code, action_status = self.execute(solution)
 
         # 실행 후 새 관절 상태 수신
         previous_time = self.state_received_at
@@ -340,6 +404,13 @@ class CartesianMove(Node):
             print("주의: 목표와 5mm 이상 차이가 있습니다.")
 
         print("\n자동 이동 절차 완료!")
+        return {
+            "target_xyz": target,
+            "actual_xyz": final_xyz,
+            "error_mm": error_mm,
+            "moveit_code": moveit_code,
+            "action_status": action_status,
+        }
 
 
 def main():
@@ -369,14 +440,19 @@ def main():
     rclpy.init()
     node = CartesianMove()
 
+    failed = False
     try:
         node.run(args)
     except Exception as e:
         print(f"\n[중단] {e}")
+        failed = True
     finally:
         node.destroy_node()
         if rclpy.ok():
             rclpy.shutdown()
+
+    if failed:
+        raise SystemExit(1)
 
 
 if __name__ == "__main__":
